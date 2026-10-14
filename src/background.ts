@@ -1,4 +1,4 @@
-import { locateImage, selectRegion, showToast, type Region } from './injected';
+import { fetchImageData, locateImage, readDomText, selectRegion, showToast, type Region } from './injected';
 import { canCapture, recordUse, recheckLicense, FREE_LIMIT } from './license';
 
 declare const __TEST__: boolean;
@@ -63,6 +63,14 @@ async function captureArea(tab: chrome.tabs.Tab) {
 
 async function captureImage(tab: chrome.tabs.Tab, srcUrl: string) {
   await guarded(tab, async (tabId) => {
+    // Best quality: read the original file instead of a screenshot of it.
+    const original = await inject<string | null>(tabId, fetchImageData, [srcUrl]).catch(() => null);
+    if (original && (await canCapture())) {
+      await toast(tabId, 'Reading text…', '', 'info');
+      const res = await offscreenCall({ type: 'ocr-original', dataUrl: original });
+      if (res.ok && res.text) return void (await finish(tabId, res.text));
+      // Unreadable or empty at full size: fall through to the screenshot route.
+    }
     const region = await inject<Region | null>(tabId, locateImage, [srcUrl]);
     if (!region) {
       await toast(tabId, 'Could not find that image', 'Drag over it instead: the area selector is starting.', 'info');
@@ -72,6 +80,15 @@ async function captureImage(tab: chrome.tabs.Tab, srcUrl: string) {
     }
     await runOcr(tab, region);
   });
+}
+
+async function offscreenCall(msg: Record<string, unknown>) {
+  await ensureOffscreen();
+  return (await chrome.runtime.sendMessage({ target: 'offscreen', ...msg })) as {
+    ok: boolean;
+    text?: string;
+    error?: string;
+  };
 }
 
 async function runOcr(tab: chrome.tabs.Tab, region: Region) {
@@ -87,18 +104,18 @@ async function runOcr(tab: chrome.tabs.Tab, region: Region) {
     return;
   }
 
+  // Real page text under the box? Copy it directly: instant and exact.
+  const domText = await inject<string | null>(tabId, readDomText, [region]).catch(() => null);
+  if (domText) {
+    const copied = await offscreenCall({ type: 'copy-text', text: domText });
+    if (copied.ok) return void (await finish(tabId, domText));
+  }
+
   // Screenshot first, so our own toast never ends up in the image.
   const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
   await toast(tabId, 'Reading text…', '', 'info');
 
-  await ensureOffscreen();
-  const result = (await chrome.runtime.sendMessage({
-    target: 'offscreen',
-    type: 'ocr-and-copy',
-    dataUrl,
-    region,
-  })) as { ok: boolean; text?: string; error?: string };
-
+  const result = await offscreenCall({ type: 'ocr-and-copy', dataUrl, region });
   if (!result?.ok) {
     await toast(tabId, 'Something went wrong', result?.error || 'OCR failed. Please try again.', 'error');
     return;
@@ -108,7 +125,10 @@ async function runOcr(tab: chrome.tabs.Tab, region: Region) {
     await toast(tabId, 'No text found', 'Try selecting a tighter area around the text.', 'error');
     return;
   }
+  await finish(tabId, text);
+}
 
+async function finish(tabId: number, text: string) {
   if (__TEST__) (globalThis as any).__lastOcr = text;
   const left = await recordUse();
   const preview = text.length > 160 ? `${text.slice(0, 160)}…` : text;
