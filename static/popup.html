@@ -1,0 +1,64 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Copy Text from Image</title>
+    <style>
+      :root {
+        --bg: #f5f3ee;
+        --card: #ffffff;
+        --text: #1c1b19;
+        --muted: #6b675f;
+        --accent: #c14d2e;
+        --border: #e4e0d6;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #161513;
+          --card: #1f1e1b;
+          --text: #f2efe8;
+          --muted: #a19c91;
+          --border: #34312c;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        width: 290px;
+        padding: 14px;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.45 system-ui, -apple-system, 'Segoe UI', sans-serif;
+      }
+      h1 { font-size: 15px; margin: 0 0 10px; }
+      button {
+        width: 100%;
+        padding: 10px;
+        border: 0;
+        border-radius: 8px;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      #select { background: var(--accent); color: #fff; }
+      #select:hover { filter: brightness(1.07); }
+      #settings {
+        margin-top: 8px;
+        background: transparent;
+        color: var(--muted);
+        border: 1px solid var(--border);
+        font-weight: 500;
+      }
+      #status { margin: 10px 0 0; color: var(--muted); font-size: 12px; text-align: center; }
+      .tip { margin-top: 10px; font-size: 12px; color: var(--muted); }
+    </style>
+  </head>
+  <body>
+    <h1>Copy Text from Image</h1>
+    <button id="select">Select area to copy text</button>
+    <button id="settings">Settings &amp; license</button>
+    <p id="status"></p>
+    <p class="tip">Tip: right-click any image and choose "Copy text from image".</p>
+    <script src="popup.js"></script>
+  </body>
+</html>

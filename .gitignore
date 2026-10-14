@@ -1,0 +1,11 @@
+node_modules/
+dist/
+dist-test/
+release/
+*.zip
+.DS_Store
+.env
+.env.*
+*.log
+.vscode/
+.idea/

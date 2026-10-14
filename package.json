@@ -1,0 +1,22 @@
+{
+  "name": "copy-text-from-image",
+  "version": "1.0.0",
+  "description": "Copy Text from Image: Offline OCR Chrome extension by Raegent",
+  "scripts": {
+    "build": "node build.mjs",
+    "build:test": "node build.mjs --test",
+    "typecheck": "tsc -p .",
+    "release": "node release.mjs"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@tesseract.js-data/eng": "^1.0.0",
+    "@types/chrome": "^0.3.4",
+    "esbuild": "^0.28.2",
+    "tesseract.js": "^5.1.1",
+    "typescript": "^7.0.2"
+  },
+  "private": true,
+  "type": "module"
+}
