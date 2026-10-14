@@ -76,7 +76,7 @@ export function prepareCanvas(
   return canvas;
 }
 
-interface OcrBox { x0: number; x1: number }
+interface OcrBox { x0: number; x1: number; y0?: number; y1?: number }
 interface OcrWord { text: string; confidence: number; bbox?: OcrBox }
 interface OcrLine { words: OcrWord[]; bbox?: OcrBox }
 interface OcrParagraph { lines: OcrLine[] }
@@ -93,6 +93,10 @@ const LINE_MIN_CONF = 55;
  */
 export function textFromBlocks(blocks: OcrBlock[] | null | undefined, fallback: string): string {
   if (!blocks || blocks.length === 0) return cleanText(fallback);
+  if (looksLikeCode(blocks)) {
+    const code = codeFromBlocks(blocks);
+    if (code) return code;
+  }
   interface Kept { text: string; left: number | null; charW: number | null }
   const paragraphs: Kept[][] = [];
   for (const block of blocks) {
@@ -188,4 +192,98 @@ export function cleanText(raw: string): string {
 
 function clamp(v: number, min: number, max: number) {
   return Math.min(max, Math.max(min, v));
+}
+
+// ---------- source code ----------
+
+const CODE_HINT = /[=(){}[\];_]|\w\.\w|^\s*#/;
+const CODE_STRONG = /[=(){};]|\b(def|return|import|const|function)\b/;
+
+/** Several lines full of brackets, assignments and identifiers: treat the box as source code. */
+function looksLikeCode(blocks: OcrBlock[]): boolean {
+  const lines = blocks.flatMap((b) => b.paragraphs.flatMap((p) => p.lines));
+  const texts = lines.map((l) => l.words.map((w) => w.text).join(' ')).filter((t) => t.trim());
+  if (texts.length < 3) return false;
+  const hinted = texts.filter((t) => CODE_HINT.test(t)).length;
+  const strong = texts.filter((t) => CODE_STRONG.test(t)).length;
+  return hinted / texts.length >= 0.6 && strong >= 2 && strong / texts.length >= 0.4;
+}
+
+/**
+ * Code needs every character: no edge trimming, symbols and comment marks stay, one line per
+ * source line, indentation snapped to the file's own indent step, blank lines where there were gaps.
+ */
+function codeFromBlocks(blocks: OcrBlock[]): string {
+  interface L { text: string; left: number; top: number; bottom: number }
+  const rows: L[] = [];
+  const allWords: OcrWord[] = [];
+  for (const block of blocks) {
+    for (const para of block.paragraphs) {
+      for (const line of para.lines) {
+        const words = line.words.filter((w) => w.text.trim() && w.confidence >= 10 && w.bbox);
+        if (!words.length) continue;
+        const avg = words.reduce((s, w) => s + w.confidence, 0) / words.length;
+        if (avg < 25) continue;
+        allWords.push(...words);
+        const bb = line.bbox;
+        rows.push({
+          text: '',
+          left: words[0].bbox!.x0,
+          top: bb?.y0 ?? 0,
+          bottom: bb?.y1 ?? 0,
+        });
+        (rows[rows.length - 1] as any).words = words;
+      }
+    }
+  }
+  if (!rows.length) return '';
+  rows.sort((a, b) => a.top - b.top);
+  const charW = medianCharWidth(allWords) || 8;
+  for (const r of rows) r.text = joinWords((r as any).words, charW);
+  const minLeft = Math.min(...rows.map((r) => r.left));
+  const cols = rows.map((r) => (r.left - minLeft) / charW);
+  const unit = indentUnit(cols);
+  const pitches = rows.slice(1).map((r, i) => r.top - rows[i].top).filter((d) => d > 0).sort((a, b) => a - b);
+  const pitch = pitches.length ? pitches[Math.floor(pitches.length / 2)] : 0;
+  const out: string[] = [];
+  rows.forEach((r, i) => {
+    if (i && pitch && r.top - rows[i - 1].top > pitch * 1.6) out.push('');
+    const c = unit ? Math.round(cols[i] / unit) * unit : Math.round(cols[i]);
+    out.push(' '.repeat(c >= 1 ? c : 0) + fixBrackets(r.text));
+  });
+  return out.join('\n').replace(/^\n+|\s+$/g, '');
+}
+
+/** The indent step (2, 4, 3 or 8 columns) that best fits the measured line offsets. */
+function indentUnit(cols: number[]): number {
+  const indented = cols.filter((c) => c >= 1);
+  if (!indented.length) return 0;
+  let best = 0;
+  let bestErr = 0.2; // average rounding error must beat this, or we leave offsets unsnapped
+  for (const u of [4, 2, 3, 8]) {
+    const err = indented.reduce((s, c) => s + Math.abs(c / u - Math.round(c / u)), 0) / indented.length;
+    if (err < bestErr) {
+      best = u;
+      bestErr = err;
+    }
+  }
+  return best;
+}
+
+/**
+ * Tesseract often reads "(" as "{" or "[" next to identifiers: build{child). A closing ")" that finds
+ * a "{" or "[" open on top of the stack means that opener was really "(".
+ */
+function fixBrackets(line: string): string {
+  const chars = line.split('');
+  const stack: number[] = [];
+  chars.forEach((ch, i) => {
+    if ('({['.includes(ch)) stack.push(i);
+    else if (ch === ')' && stack.length) {
+      const j = stack.pop()!;
+      if (chars[j] !== '(') chars[j] = '(';
+    } else if (ch === '}' && stack.length) stack.pop();
+    else if (ch === ']' && stack.length) stack.pop();
+  });
+  return chars.join('');
 }
