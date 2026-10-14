@@ -133,6 +133,113 @@ export function selectRegion(): Promise<Region | null> {
   });
 }
 
+/**
+ * Reads real page text inside the box straight from the DOM (instant, exact). Returns null when
+ * the box is mostly an image, video or canvas, or holds no real text, so the caller can fall back to OCR.
+ */
+export function readDomText(r: { x: number; y: number; w: number; h: number }): string | null {
+  const inside = (cx: number, cy: number) => cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h;
+
+  // 1. If pictures cover a good part of the box, the text is probably inside them: use OCR.
+  let media = 0;
+  let samples = 0;
+  const N = 6;
+  for (let i = 0; i < N; i++) {
+    for (let j = 0; j < N; j++) {
+      const el = document.elementFromPoint(r.x + ((i + 0.5) * r.w) / N, r.y + ((j + 0.5) * r.h) / N);
+      if (!el) continue;
+      samples++;
+      if (/^(IMG|VIDEO|CANVAS|PICTURE|OBJECT|EMBED|IFRAME)$/i.test(el.tagName)) media++;
+      else if (el.tagName === 'svg' || el.closest('svg')) media++;
+      else if (getComputedStyle(el).backgroundImage.startsWith('url(') && !(el.textContent || '').trim()) media++;
+    }
+  }
+  if (!samples || media / samples >= 0.15) return null;
+
+  // 2. Collect words whose centre lies inside the box and that are really visible there.
+  interface W { t: string; x0: number; x1: number; y0: number; y1: number }
+  const words: W[] = [];
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  const range = document.createRange();
+  let count = 0;
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const text = n.nodeValue || '';
+    const parent = n.parentElement;
+    if (!parent || !text.trim() || /^(SCRIPT|STYLE|NOSCRIPT|TEXTAREA)$/i.test(parent.tagName)) continue;
+    range.selectNodeContents(n);
+    const nb = range.getBoundingClientRect();
+    if (nb.right < r.x || nb.left > r.x + r.w || nb.bottom < r.y || nb.top > r.y + r.h) continue;
+    const cs = getComputedStyle(parent);
+    if (cs.visibility === 'hidden' || cs.display === 'none' || parseFloat(cs.opacity) === 0) continue;
+    const re = /\S+/g;
+    for (let m = re.exec(text); m; m = re.exec(text)) {
+      range.setStart(n, m.index);
+      range.setEnd(n, m.index + m[0].length);
+      for (const b of Array.from(range.getClientRects())) {
+        if (!b.width || !b.height) continue;
+        const cx = b.left + b.width / 2;
+        const cy = b.top + b.height / 2;
+        if (!inside(cx, cy)) continue;
+        const top = document.elementFromPoint(cx, cy);
+        if (!top || !(parent.contains(top) || top.contains(parent))) continue; // covered by something else
+        if (++count > 4000) return null;
+        words.push({ t: m[0], x0: b.left, x1: b.right, y0: b.top, y1: b.bottom });
+        break;
+      }
+    }
+  }
+  if (!words.length) return null;
+
+  // 3. Group words into lines by vertical overlap, then rebuild spacing and indentation.
+  words.sort((a, b) => a.y0 + a.y1 - (b.y0 + b.y1) || a.x0 - b.x0);
+  const lines: W[][] = [];
+  for (const w of words) {
+    const last = lines[lines.length - 1];
+    const ref = last && last[0];
+    if (ref && Math.abs(w.y0 + w.y1 - (ref.y0 + ref.y1)) / 2 < Math.min(w.y1 - w.y0, ref.y1 - ref.y0) * 0.6) last.push(w);
+    else lines.push([w]);
+  }
+  const widths = words.filter((w) => w.t.length >= 2).map((w) => (w.x1 - w.x0) / w.t.length).sort((a, b) => a - b);
+  const charW = widths.length ? widths[Math.floor(widths.length / 2)] : 8;
+  const minLeft = Math.min(...lines.map((l) => Math.min(...l.map((w) => w.x0))));
+  const out: string[] = [];
+  let prevBottom = 0;
+  for (const l of lines) {
+    l.sort((a, b) => a.x0 - b.x0);
+    let text = l[0].t;
+    for (let i = 1; i < l.length; i++) {
+      const gap = (l[i].x0 - l[i - 1].x1) / charW;
+      text += ' '.repeat(gap >= 3 ? Math.round(gap) : 1) + l[i].t;
+    }
+    const cols = Math.round((l[0].x0 - minLeft) / charW);
+    const top = Math.min(...l.map((w) => w.y0));
+    const height = Math.max(...l.map((w) => w.y1)) - top;
+    if (out.length && top - prevBottom > height * 0.8) out.push(''); // paragraph gap
+    out.push((cols >= 2 ? ' '.repeat(cols) : '') + text);
+    prevBottom = Math.max(...l.map((w) => w.y1));
+  }
+  const result = out.join('\n').replace(/\s+$/, '');
+  return /[\p{L}\p{N}]/u.test(result) ? result : null;
+}
+
+/** Fetches the right-clicked image at full resolution, from inside the page so cookies and CORS rules match. */
+export async function fetchImageData(srcUrl: string): Promise<string | null> {
+  try {
+    const res = await fetch(srcUrl, { credentials: 'include' });
+    if (!res.ok) return null;
+    const blob = await res.blob();
+    if (!blob.type.startsWith('image/') || blob.type.includes('svg') || blob.size > 15_000_000) return null;
+    return await new Promise<string | null>((resolve) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(typeof fr.result === 'string' ? fr.result : null);
+      fr.onerror = () => resolve(null);
+      fr.readAsDataURL(blob);
+    });
+  } catch {
+    return null;
+  }
+}
+
 /** Finds the right-clicked image, scrolls it into view and returns its visible box. */
 export function locateImage(srcUrl: string): Promise<Region | null> {
   return new Promise((resolve) => {

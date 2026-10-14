@@ -14,6 +14,7 @@ export function prepareCanvas(
   bitmap: BitmapLike & CanvasImageSource,
   region: Region,
   makeCanvas: () => CanvasLike,
+  opts: { scale?: number } = {},
 ): CanvasLike {
   // Screenshot pixels per CSS pixel. Accounts for display scaling and page zoom.
   const ratio = bitmap.width / region.vw;
@@ -31,6 +32,7 @@ export function prepareCanvas(
   const maxSide = 5000;
   const maxPixels = 18_000_000;
   scale = Math.min(scale, maxSide / sw, maxSide / sh, Math.sqrt(maxPixels / (sw * sh)));
+  if (opts.scale) scale = Math.min(opts.scale, maxSide / sw, maxSide / sh, Math.sqrt(maxPixels / (sw * sh)));
   scale = Math.max(scale, 0.25);
 
   const canvas = makeCanvas();
@@ -39,21 +41,36 @@ export function prepareCanvas(
   const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
+  // Transparent PNGs would otherwise read as black and trigger the dark-mode inversion below.
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(bitmap, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
 
   const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const px = img.data;
+  const hist = new Uint32Array(256);
   let sum = 0;
   for (let i = 0; i < px.length; i += 4) {
     const lum = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
     px[i] = px[i + 1] = px[i + 2] = lum;
+    hist[lum | 0]++;
     sum += lum;
   }
-  const mean = sum / (px.length / 4);
-  if (mean < 110) {
-    for (let i = 0; i < px.length; i += 4) {
-      px[i] = px[i + 1] = px[i + 2] = 255 - px[i];
-    }
+  const total = px.length / 4;
+  const mean = sum / total;
+  // Stretch contrast between the 2nd and 98th percentile so faint grey text becomes crisp.
+  let lo = 0;
+  let hi = 255;
+  for (let acc = 0; lo < 255 && (acc += hist[lo]) < total * 0.02; lo++);
+  for (let acc = 0; hi > 0 && (acc += hist[hi]) < total * 0.02; hi--);
+  const span = hi - lo;
+  const stretch = span >= 30 && span < 235;
+  const invert = mean < 110;
+  for (let i = 0; i < px.length; i += 4) {
+    let v = px[i];
+    if (stretch) v = clamp(((v - lo) * 255) / span, 0, 255);
+    if (invert) v = 255 - v;
+    px[i] = px[i + 1] = px[i + 2] = v;
   }
   ctx.putImageData(img, 0, 0);
   return canvas;
@@ -94,7 +111,7 @@ export function textFromBlocks(blocks: OcrBlock[] | null | undefined, fallback: 
         if (avg < LINE_MIN_CONF && strong < Math.ceil(words.length / 2)) continue;
         const charW = medianCharWidth(words);
         const text = joinWords(words, charW);
-        if (!/[\p{L}\p{N}]{2,}/u.test(text)) continue;
+        if (!/[\p{L}\p{N}]{2,}/u.test(text) && !words.every(isCodeSymbol)) continue;
         lines.push({ text, left: words[0].bbox ? words[0].bbox.x0 : null, charW });
       }
       if (lines.length) paragraphs.push(lines);
@@ -142,8 +159,17 @@ function joinWords(words: OcrWord[], charW: number | null): string {
   return out;
 }
 
+// Brackets and punctuation that real code lines start or end with. Kept when Tesseract is confident.
+const CODE_SYMBOLS = /^[{}()[\];,.:<>=+\-*/\\"'`;]+$/;
+const CODE_SYMBOL_MIN_CONF = 75;
+
+function isCodeSymbol(w: OcrWord): boolean {
+  return w.confidence >= CODE_SYMBOL_MIN_CONF && CODE_SYMBOLS.test(w.text.trim());
+}
+
 function isEdgeJunk(w: OcrWord): boolean {
   const t = w.text.trim();
+  if (isCodeSymbol(w)) return false;
   if (w.confidence < EDGE_MIN_CONF) return true;
   if (!/[\p{L}\p{N}]/u.test(t)) return true; // lone symbols: "(", "—", "|", "&"
   if (t.length === 1 && !/^[aAI]$/.test(t)) return true; // stray single characters
