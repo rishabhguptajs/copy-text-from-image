@@ -171,6 +171,8 @@ export function readDomText(r: { x: number; y: number; w: number; h: number }): 
     if (nb.right < r.x || nb.left > r.x + r.w || nb.bottom < r.y || nb.top > r.y + r.h) continue;
     const cs = getComputedStyle(parent);
     if (cs.visibility === 'hidden' || cs.display === 'none' || parseFloat(cs.opacity) === 0) continue;
+    // Invisible-ink text (transparent colour, zero size) must not reach the clipboard: the user cannot see it.
+    if (/^rgba\(.*,\s*0\)$/.test(cs.color) || cs.color === 'transparent' || parseFloat(cs.fontSize) < 4) continue;
     const re = /\S+/g;
     for (let m = re.exec(text); m; m = re.exec(text)) {
       range.setStart(n, m.index);
