@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Copy Text from Image: Offline OCR",
   "short_name": "Copy Text from Image",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Copy text from any image, video frame or unselectable text on a page. Runs 100% offline. Nothing is uploaded.",
   "author": "Raegent",
   "homepage_url": "https://raegent.com/ocr",
