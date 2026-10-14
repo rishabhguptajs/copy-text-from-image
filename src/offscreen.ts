@@ -1,6 +1,6 @@
 import { createWorker, PSM, type Worker } from 'tesseract.js';
 import type { Region } from './injected';
-import { prepareCanvas, textFromBlocks } from './ocr-utils';
+import { looksLikeCode, prepareCanvas, refineCodeBlocks, textFromBlocks } from './ocr-utils';
 
 let workerPromise: Promise<Worker> | null = null;
 
@@ -49,7 +49,36 @@ async function recognize(canvas: HTMLCanvasElement, singleLine: boolean): Promis
   // A one-line selection is read much faster, and more accurately, as a single line.
   await worker.setParameters({ tessedit_pageseg_mode: singleLine ? PSM.SINGLE_LINE : PSM.AUTO });
   const { data } = await worker.recognize(canvas, {}, { text: true, blocks: true });
-  return textFromBlocks(data.blocks as any, data.text || '');
+  const blocks = data.blocks as any;
+  if (!singleLine && blocks && looksLikeCode(blocks)) {
+    // Code: re-read each line on its own and pick up lines the page pass skipped.
+    const img = canvas.getContext('2d', { willReadFrequently: true })!.getImageData(0, 0, canvas.width, canvas.height);
+    await worker.setParameters({ tessedit_pageseg_mode: PSM.SINGLE_LINE });
+    try {
+      await refineCodeBlocks(blocks, img, async (rect) => {
+        // Recognise a small padded crop: handing the worker the whole canvas re-encodes it every call.
+        const M = 10;
+        const crop = document.createElement('canvas');
+        crop.width = rect.width + 2 * M;
+        crop.height = rect.height + 2 * M;
+        const cctx = crop.getContext('2d')!;
+        cctx.fillStyle = '#fff';
+        cctx.fillRect(0, 0, crop.width, crop.height);
+        cctx.drawImage(canvas, rect.left, rect.top, rect.width, rect.height, M, M, rect.width, rect.height);
+        const r = await worker.recognize(crop, {}, { blocks: true });
+        const words = ((r.data.blocks as any[]) ?? []).flatMap((b) => b.paragraphs.flatMap((p: any) => p.lines.flatMap((l: any) => l.words)));
+        const dx = rect.left - M;
+        const dy = rect.top - M;
+        for (const w of words) {
+          if (w.bbox) w.bbox = { x0: w.bbox.x0 + dx, x1: w.bbox.x1 + dx, y0: w.bbox.y0 + dy, y1: w.bbox.y1 + dy };
+        }
+        return words;
+      });
+    } catch {
+      // Keep the first-pass result if the refinement fails.
+    }
+  }
+  return textFromBlocks(blocks, data.text || '');
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {

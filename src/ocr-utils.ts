@@ -80,7 +80,8 @@ interface OcrBox { x0: number; x1: number; y0?: number; y1?: number }
 interface OcrWord { text: string; confidence: number; bbox?: OcrBox }
 interface OcrLine { words: OcrWord[]; bbox?: OcrBox }
 interface OcrParagraph { lines: OcrLine[] }
-interface OcrBlock { paragraphs: OcrParagraph[] }
+export interface OcrBlock { paragraphs: OcrParagraph[] }
+export interface Rect { left: number; top: number; width: number; height: number }
 
 const EDGE_MIN_CONF = 50; // junk sits at line edges, next to photos and icons
 const INNER_MIN_CONF = 15; // words between good words are kept unless clearly garbage
@@ -200,7 +201,7 @@ const CODE_HINT = /[=(){}[\];_]|\w\.\w|^\s*#/;
 const CODE_STRONG = /[=(){};]|\b(def|return|import|const|function)\b/;
 
 /** Several lines full of brackets, assignments and identifiers: treat the box as source code. */
-function looksLikeCode(blocks: OcrBlock[]): boolean {
+export function looksLikeCode(blocks: OcrBlock[]): boolean {
   const lines = blocks.flatMap((b) => b.paragraphs.flatMap((p) => p.lines));
   const texts = lines.map((l) => l.words.map((w) => w.text).join(' ')).filter((t) => t.trim());
   if (texts.length < 3) return false;
@@ -220,16 +221,26 @@ function codeFromBlocks(blocks: OcrBlock[]): string {
   for (const block of blocks) {
     for (const para of block.paragraphs) {
       for (const line of para.lines) {
-        const words = line.words.filter((w) => w.text.trim() && w.confidence >= 10 && w.bbox);
+        // Short code lines like "build(root)" often score low; losing a line is worse than a typo.
+        const words = line.words.filter((w) => w.text.trim() && w.bbox);
+        // A lone glyph far to the right of the line ("I", "|") is a speck, not code. It also stretches the
+        // line's box upward and hides the blank line above it.
+        const lineCharW = medianCharWidth(words);
+        while (words.length > 1 && lineCharW) {
+          const last = words[words.length - 1];
+          const prev = words[words.length - 2];
+          if (/^[Il|1.,'`]$/.test(last.text.trim()) && last.confidence < 85 && (last.bbox!.x0 - prev.bbox!.x1) / lineCharW >= 4) words.pop();
+          else break;
+        }
         if (!words.length) continue;
         const avg = words.reduce((s, w) => s + w.confidence, 0) / words.length;
-        if (avg < 25) continue;
+        if (avg < 8 && !/[A-Za-z0-9]{3,}/.test(words.map((w) => w.text).join(''))) continue;
         allWords.push(...words);
         const bb = line.bbox;
         rows.push({
           text: '',
           left: words[0].bbox!.x0,
-          top: bb?.y0 ?? 0,
+          top: Math.min(...words.map((w) => w.bbox!.y0 ?? bb?.y0 ?? 0)),
           bottom: bb?.y1 ?? 0,
         });
         (rows[rows.length - 1] as any).words = words;
@@ -239,7 +250,17 @@ function codeFromBlocks(blocks: OcrBlock[]): string {
   if (!rows.length) return '';
   rows.sort((a, b) => a.top - b.top);
   const charW = medianCharWidth(allWords) || 8;
-  for (const r of rows) r.text = joinWords((r as any).words, charW);
+  for (const r of rows) {
+    r.text = joinWords((r as any).words, charW);
+    // The "i" of a leading "if" is often dropped, which also shifts the line one glyph left.
+    if (/^f\s.*:$/.test(r.text)) {
+      r.text = 'i' + r.text;
+      r.left -= charW;
+    }
+  }
+  restoreLeadingCall(rows as any, charW);
+  const fixed = repairIdentifiers(rows.map((r) => r.text));
+  rows.forEach((r, i) => (r.text = fixed[i]));
   const minLeft = Math.min(...rows.map((r) => r.left));
   const cols = rows.map((r) => (r.left - minLeft) / charW);
   const unit = indentUnit(cols);
@@ -249,9 +270,9 @@ function codeFromBlocks(blocks: OcrBlock[]): string {
   rows.forEach((r, i) => {
     if (i && pitch && r.top - rows[i - 1].top > pitch * 1.6) out.push('');
     const c = unit ? Math.round(cols[i] / unit) * unit : Math.round(cols[i]);
-    out.push(' '.repeat(c >= 1 ? c : 0) + fixBrackets(r.text));
+    out.push(' '.repeat(c >= 1 ? c : 0) + fixBrackets(straightenQuotes(r.text)).replace(/(["'])\s*[&§$#*%]{1,3}\s*\(/, '$1 % ('));
   });
-  return out.join('\n').replace(/^\n+|\s+$/g, '');
+  return out.join('\n').replace(/[ \t]+$/gm, '').replace(/^\n+|\s+$/g, '');
 }
 
 /** The indent step (2, 4, 3 or 8 columns) that best fits the measured line offsets. */
@@ -270,20 +291,290 @@ function indentUnit(cols: number[]): number {
   return best;
 }
 
+function straightenQuotes(line: string): string {
+  return line.replace(/[\u2018\u2019\u201B]/g, "'").replace(/[\u201C\u201D]/g, '"');
+}
+
 /**
- * Tesseract often reads "(" as "{" or "[" next to identifiers: build{child). A closing ")" that finds
- * a "{" or "[" open on top of the stack means that opener was really "(".
+ * Tesseract misreads "(" and ")" as "{", "}", "[", "l" or "i": build{child), (child, v}).
+ * Closers are matched against the opener on the stack and the wrong half is corrected.
+ * Letters misread as brackets are left alone: guessing would corrupt real identifiers.
  */
 function fixBrackets(line: string): string {
   const chars = line.split('');
   const stack: number[] = [];
-  chars.forEach((ch, i) => {
+  let quote = '';
+  for (let i = 0; i < chars.length; i++) {
+    let ch = chars[i];
+    if (quote) {
+      if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === '{' && i > 0 && /[A-Za-z0-9_]/.test(chars[i - 1])) ch = chars[i] = '(';
     if ('({['.includes(ch)) stack.push(i);
-    else if (ch === ')' && stack.length) {
-      const j = stack.pop()!;
-      if (chars[j] !== '(') chars[j] = '(';
-    } else if (ch === '}' && stack.length) stack.pop();
-    else if (ch === ']' && stack.length) stack.pop();
-  });
+    else if (ch === ')') {
+      if (stack.length) chars[stack.pop()!] = '(';
+    } else if (ch === '}' || ch === ']') {
+      if (!stack.length) continue;
+      const open = stack.pop()!;
+      if (chars[open] === '(') chars[i] = ')';
+    }
+  }
   return chars.join('');
+}
+
+// ---------- second pass for code ----------
+
+const lineAvg = (words: OcrWord[]) => (words.length ? words.reduce((s, w) => s + w.confidence, 0) / words.length : -1);
+
+/**
+ * Bands of ink (full-width rows) that no recognised line covers. Tesseract sometimes skips a short
+ * line such as "build(root)"; its ink is still there. Expects dark text on a light background.
+ */
+export function uncoveredBands(
+  img: { data: Uint8ClampedArray; width: number; height: number },
+  boxes: { y0: number; y1: number }[],
+  words: { y0: number; y1: number }[] = [],
+): { y0: number; y1: number }[] {
+  if (!boxes.length) return [];
+  const { data, width, height } = img;
+  const need = Math.max(2, Math.round(width * 0.0015));
+  const ink: boolean[] = [];
+  for (let y = 0; y < height; y++) {
+    let n = 0;
+    for (let x = 0; x < width; x++) if (data[(y * width + x) * 4] < 110) n++;
+    ink.push(n >= need);
+  }
+  const hs = boxes.map((b) => b.y1 - b.y0).sort((a, b) => a - b);
+  const medH = hs[Math.floor(hs.length / 2)] || 10;
+  const gapMax = Math.max(2, Math.round(medH * 0.3));
+  // Look only inside the gaps between recognised lines. Across the whole selection, the brackets of two
+  // neighbouring lines touch and their ink fuses into one band that looks covered.
+  const sorted = [...boxes].sort((a, b) => a.y0 - b.y0);
+  const found: { y0: number; y1: number }[] = [];
+  let reach = sorted[0].y1;
+  for (let i = 1; i < sorted.length; i++) {
+    const from = reach + 1;
+    const to = sorted[i].y0 - 1;
+    reach = Math.max(reach, sorted[i].y1);
+    if (to - from + 1 < medH * 0.45) continue;
+    let cur: { y0: number; y1: number } | null = null;
+    let gap = 0;
+    const close = () => {
+      if (cur && cur.y1 - cur.y0 + 1 >= medH * 0.45) found.push(cur);
+      cur = null;
+    };
+    for (let y = from; y <= to; y++) {
+      if (ink[y]) {
+        if (!cur) cur = { y0: y, y1: y };
+        cur.y1 = y;
+        gap = 0;
+      } else if (cur && ++gap > gapMax) close();
+    }
+    close();
+  }
+  return found;
+}
+
+/**
+ * Re-reads every line of a code selection on its own (single-line mode is far more accurate than
+ * page layout mode), keeps whichever reading is more confident, and reads ink bands the first pass
+ * missed. `ocrRect` runs single-line OCR on a rectangle and returns the words found there.
+ */
+export async function refineCodeBlocks(
+  blocks: OcrBlock[],
+  img: { data: Uint8ClampedArray; width: number; height: number },
+  ocrRect: (r: Rect) => Promise<OcrWord[]>,
+): Promise<void> {
+  const lines = blocks.flatMap((b) => b.paragraphs.flatMap((p) => p.lines));
+  const boxes = lines.filter((l) => l.bbox && l.bbox.y0 !== undefined).map((l) => ({ y0: l.bbox!.y0!, y1: l.bbox!.y1! }));
+  const lineHs = boxes.map((b) => b.y1 - b.y0).sort((a, b) => a - b);
+  const medLine = lineHs[Math.floor(lineHs.length / 2)] || 20;
+  const rectFor = (x0: number, y0: number, x1: number, y1: number, pad?: number): Rect => {
+    const padY = pad ?? Math.max(2, Math.round((y1 - y0) * 0.15));
+    const left = clamp(Math.round(x0) - 8, 0, img.width - 1);
+    const top = clamp(Math.round(y0) - padY, 0, img.height - 1);
+    return {
+      left,
+      top,
+      width: clamp(Math.round(x1) + 8 - left, 1, img.width - left),
+      height: clamp(Math.round(y1) + padY - top, 1, img.height - top),
+    };
+  };
+  // Page-mode lines that are already confident are left alone: re-reading them only costs time.
+  const redo: { line: OcrLine; second: OcrWord[] }[] = [];
+  for (const line of lines) {
+    const bb = line.bbox;
+    if (!bb || bb.y0 === undefined || bb.y1 === undefined) continue;
+    const ws = line.words.filter((w) => w.text.trim());
+    if (ws.length && lineAvg(ws) >= 92 && ws.every((w) => w.confidence >= 70)) continue;
+    const second = await ocrRect(rectFor(bb.x0, bb.y0, bb.x1, bb.y1));
+    if (second.length && second.every((w) => w.bbox)) redo.push({ line, second });
+  }
+  // Pick between the two readings by how many of their names occur in the other lines, then by confidence.
+  const tokensOf = (ws: OcrWord[]) => new Set(ws.map((w) => w.text).join(' ').match(/[A-Za-z_][A-Za-z0-9_]{2,}/g) ?? []);
+  const lineSets = new Map<OcrLine, Set<string>>();
+  const lineCount = new Map<string, number>();
+  for (const line of lines) {
+    const set = tokensOf(line.words);
+    const other = redo.find((r) => r.line === line);
+    if (other) for (const t of tokensOf(other.second)) set.add(t);
+    lineSets.set(line, set);
+    for (const t of set) lineCount.set(t, (lineCount.get(t) ?? 0) + 1);
+  }
+  const score = (line: OcrLine, ws: OcrWord[]) => {
+    const own = lineSets.get(line)!;
+    let sc = lineAvg(ws) / 100;
+    for (const t of tokensOf(ws)) sc += (lineCount.get(t) ?? 0) - (own.has(t) ? 1 : 0) >= 1 ? 1 : -1;
+    return sc;
+  };
+  for (const { line, second } of redo) {
+    const bb = line.bbox!;
+    let words = score(line, second) >= score(line, line.words) ? second : line.words;
+    const other = words === second ? line.words : second;
+    // Whichever reading wins may still start with a junk word ("Fr", "oe"): borrow the other reading's
+    // confident word for that spot, and drop the junk and anything it covers.
+    const first = words[0];
+    const spot = other.find((w) => w.bbox && first.bbox && w.bbox.x0 <= first.bbox.x0 + 12 && w.bbox.x1 > first.bbox.x0 + 12);
+    if (spot && first.text.length <= 3 && first.confidence < 60 && spot.confidence >= 80 && spot.text.length > first.text.length) {
+      words = [spot, ...words.filter((w) => w.bbox!.x0 >= spot.bbox!.x1 - 4)];
+    }
+    line.words = words;
+    line.bbox = { x0: words[0].bbox!.x0, x1: words[words.length - 1].bbox!.x1, y0: bb.y0, y1: bb.y1 };
+  }
+  const extra: OcrLine[] = [];
+  const wordBoxes = lines.flatMap((l) =>
+    l.words.filter((w) => w.text.trim() && w.bbox && w.bbox.y0 !== undefined).map((w) => ({ y0: w.bbox!.y0!, y1: w.bbox!.y1! })),
+  );
+  for (const band of uncoveredBands(img, boxes, wordBoxes)) {
+    // Crop to the band's own ink columns and a full line's height: a tight, full-width strip reads as noise.
+    let minX = img.width;
+    let maxX = 0;
+    for (let y = band.y0; y <= band.y1; y++) {
+      for (let x = 0; x < img.width; x++) {
+        if (img.data[(y * img.width + x) * 4] < 110) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+        }
+      }
+    }
+    if (maxX <= minX) continue;
+    const mid = (band.y0 + band.y1) / 2;
+    const half = medLine * 0.65;
+    const words = await ocrRect(rectFor(minX, mid - half, maxX, mid + half, 0));
+    const known = [...tokensOf(words)].filter((t) => (lineCount.get(t) ?? 0) >= 1).length;
+    if (words.length && (lineAvg(words) >= 45 || (lineAvg(words) >= 10 && known >= 1) || known >= 2) && /[A-Za-z0-9]{2,}/.test(words.map((w) => w.text).join(''))) {
+      extra.push({ words, bbox: { x0: words[0].bbox!.x0, x1: words[words.length - 1].bbox!.x1, y0: band.y0, y1: band.y1 } });
+    }
+  }
+  if (extra.length && blocks.length) blocks[0].paragraphs.push({ lines: extra });
+}
+
+const KNOWN_WORDS = new Set(
+  ('def return for in if not else elif while import from class self None True False and or is lambda with as try except ' +
+    'str int float len id print range set list dict tuple type sum min max abs open map zip sorted enumerate isinstance ' +
+    'const let var function this new null undefined true false typeof async await console log').split(' '),
+);
+
+const levenshtein1 = (a: string, b: string) => {
+  if (a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i] && ++d > 1) return false;
+  return d === 1;
+};
+
+/**
+ * Fixes glyph confusions using the code's own vocabulary: "striid" is "str(id" when both names occur
+ * elsewhere, "wid" is "uid" when "uid" is used five times, "nl" is "n1" when "n2" exists.
+ */
+function repairIdentifiers(lines: string[]): string[] {
+  const split = (l: string) => {
+    const i = l.indexOf('#');
+    return i < 0 ? [l, ''] : [l.slice(0, i), l.slice(i)];
+  };
+  const freq = new Map<string, number>();
+  for (const l of lines) for (const t of split(l)[0].match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? []) freq.set(t, (freq.get(t) ?? 0) + 1);
+  const KEYWORDS = new Set(['if', 'for', 'while', 'return', 'in', 'not', 'and', 'or', 'elif', 'else', 'with', 'switch', 'catch', 'print']);
+  // Names used as calls elsewhere ("build(child)"): a space before "(" after them is a misread gap.
+  const callNames = new Set<string>();
+  for (const l of lines) for (const m of split(l)[0].matchAll(/([A-Za-z_]\w*)\(/g)) if (!KEYWORDS.has(m[1])) callNames.add(m[1]);
+  const known = (t: string) => KNOWN_WORDS.has(t) || (freq.get(t) ?? 0) >= 2;
+  const seen = (t: string) => t.length >= 2 && (KNOWN_WORDS.has(t) || (freq.get(t) ?? 0) >= 1);
+  const strong = [...freq].filter(([t, n]) => n >= 3 && t.length >= 3).map(([t]) => t);
+  const fix = (t: string): string => {
+    for (let k = 2; k < t.length - 2; k++) {
+      if ('liI1|'.includes(t[k]) && seen(t.slice(0, k)) && seen(t.slice(k + 1))) return t.slice(0, k) + '(' + t.slice(k + 1);
+    }
+    if (t.includes('_')) return t.split('_').map((part) => (part.length >= 3 ? fix(part) : part)).join('_');
+    if (known(t) && !/^[a-z]+[lI]$/.test(t)) return t;
+    const m = /^([A-Za-z]+)[lI]$/.exec(t);
+    if (m && [...freq.keys()].some((k) => k === m[1] + '2' || k === m[1] + '3')) return m[1] + '1';
+    if (known(t)) return t;
+    // A stray glyph glued to a known name: "buildi(child)" is "build(child)".
+    if (/[liI|]$/.test(t) && known(t.slice(0, -1)) && t.length > 3) return t.slice(0, -1);
+    if (t.length >= 3) {
+      const near = strong.filter((u) => levenshtein1(t, u));
+      if (!near.length) return t;
+      near.sort((a, b) => (freq.get(b) ?? 0) - (freq.get(a) ?? 0));
+      if (near.length === 1 || (freq.get(near[0]) ?? 0) >= 2 * (freq.get(near[1]) ?? 0)) return near[0];
+    }
+    return t;
+  };
+  return lines.map((l) => {
+    const [code, comment] = split(l);
+    const tidy = code
+      .replace(/[A-Za-z_][A-Za-z0-9_]*/g, fix)
+      .replace(/(\w)\.\s+(?=[A-Za-z_])/g, '$1.') // "edges. add" -> "edges.add"
+      .replace(/\b([A-Za-z_]\w*)\s+\(/g, (m, n) => (callNames.has(n) ? n + '(' : m))
+      .replace(/(\.[A-Za-z_]\w*)\s+\(/g, '$1(') // "dot.edge (" -> "dot.edge("
+      .replace(/\._\s+(?=[A-Za-z])/g, '._') // "n2._ op" -> "n2._op"
+      .replace(/\(\s+/g, '(')
+      .replace(/([^\s,])\s+\)/g, '$1)');
+    const digits = comment.replace(/\b([a-z]+)[lI]\b/g, (m, base) =>
+      [...freq.keys()].some((k) => k === base + '2' || k === base + '3') ? base + '1' : m,
+    );
+    const call = balanceCall(fixBrackets(tidy).replace(/^(\s*[A-Za-z_]\w*),(?=[A-Za-z_]\w*\()/, '$1.'))
+      .replace(/\(\s+/g, '(')
+      .replace(/%\.(\d)7f?(?!\d)/g, '%.$1f');
+    return call + digits;
+  });
+}
+
+/** "x.add(child, v))" has one ")" too many: the tuple\'s opening "(" was lost. */
+function balanceCall(code: string): string {
+  const opens = (code.match(/\(/g) ?? []).length;
+  const closes = (code.match(/\)/g) ?? []).length;
+  if (closes !== opens + 1) return code;
+  const i = code.indexOf('(');
+  if (i < 0 || !/^\w+\s*,/.test(code.slice(i + 1))) return code;
+  return code.slice(0, i + 1) + '(' + code.slice(i + 1);
+}
+
+/**
+ * A line whose start was read as a short junk word followed by a wide gap ("rr      = uid, ...") lost a
+ * call like "dot.node(name". A sibling line that starts "dot.node(name = uid ..." supplies it: same
+ * word after the "=", and a prefix about as wide as the gap.
+ */
+function restoreLeadingCall(rows: { text: string; words?: OcrWord[] }[], charW: number): void {
+  for (const r of rows) {
+    const ws = r.words;
+    if (!ws || ws.length < 3 || !ws[0].bbox || !ws[1].bbox) continue;
+    if (ws[0].text.length > 3 || ws[0].confidence >= 70 || !/^=/.test(ws[1].text) || /[(.]/.test(ws[0].text)) continue;
+    const span = (ws[1].bbox.x0 - ws[0].bbox.x0) / charW;
+    if (span < 5) continue;
+    const next = ws[1].text === '=' ? ws[2].text : ws[1].text.slice(1);
+    const key = next.replace(/[^\w]+$/, '');
+    for (const o of rows) {
+      if (o === r) continue;
+      const m = /^\s*([\w.]+\([^=]*?)\s*=\s*(\S+)/.exec(o.text);
+      if (!m || m[2].replace(/[^\w]+$/, '') !== key) continue;
+      if (Math.abs(m[1].length + 1 - span) > 3) continue;
+      r.text = r.text.replace(/^(\s*)\S+\s+=/, '$1' + m[1] + ' =');
+      break;
+    }
+  }
 }
